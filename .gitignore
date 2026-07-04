@@ -1,0 +1,18 @@
+# ── 민감정보 (절대 커밋 금지) ──
+# 실제 Google 로그인 세션·쿠키가 들어있는 Chrome 프로필
+chrome_profile/
+browser_profile/
+
+# ── 실행/빌드 산출물 ──
+ZEP카메라.app/
+__pycache__/
+*.pyc
+*.pyo
+verify_output.log
+*.log
+
+# ── 작업 아티팩트 ──
+.playwright-mcp/
+
+# ── macOS ──
+.DS_Store
