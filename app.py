@@ -22,6 +22,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 import tkinter as tk
 from datetime import datetime
@@ -30,7 +31,13 @@ from tkinter import messagebox, scrolledtext, ttk
 from playwright.sync_api import sync_playwright
 
 # ─────────────────────────── 설정값 ───────────────────────────
-CAMERA_SEL = '[data-sentry-element="MediaDeviceButton"]'  # 아래에서 .nth(1) = 카메라
+# 카메라 버튼 셀렉터 (앞에서부터 순서대로 시도)
+#  1) aria-label="카메라"  — 현재 ZEP이 쓰는 방식 (가장 안정적)
+#  2) data-sentry-element="MediaDeviceButton" 의 2번째 — 예전 방식 폴백(1번=마이크)
+CAMERA_SELECTORS = [
+    '[aria-label="카메라"]',
+    '[data-sentry-element="MediaDeviceButton"] >> nth=1',
+]
 
 # ── 스케줄 규칙 (필요하면 여기 숫자만 바꾸세요) ──
 CLICK_MINUTES = [0, 50]  # 동작 시각: 매시 정각(:00)과 50분(:50)
@@ -85,11 +92,31 @@ def desired_camera_on(t: datetime) -> bool:
     return t.minute < 50
 
 
+def camera_button(page, timeout=15000):
+    """현재 페이지에서 카메라 버튼을 찾아 locator 반환 (못 찾으면 None).
+
+    ZEP이 프론트엔드를 바꿔도 견디도록 여러 셀렉터를 순서대로 시도한다.
+    """
+    deadline = time.time() + timeout / 1000
+    while True:
+        for sel in CAMERA_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    return btn
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.3)
+
+
 def read_camera_state(page):
     """카메라 버튼 상태를 읽어 True(켜짐)/False(꺼짐)/None(판별불가) 반환."""
     try:
-        btn = page.locator(CAMERA_SEL).nth(1)
-        btn.wait_for(state="visible", timeout=15000)
+        btn = camera_button(page)
+        if btn is None:
+            return None
         tokens = (btn.get_attribute("class") or "").split()
         has_red = "text-red" in tokens  # 신호 1: 빨강 토큰 = 꺼짐
         d = btn.locator("path").first.get_attribute("d") or ""
@@ -309,7 +336,11 @@ class Worker:
             self._log(f"이미 {label} 상태 — 클릭하지 않습니다.")
             return
         try:
-            page.locator(CAMERA_SEL).nth(1).click()
+            btn = camera_button(page)
+            if btn is None:
+                self._log("카메라 버튼을 찾지 못했습니다 — 이번 동작을 건너뜁니다.")
+                return
+            btn.click()
         except Exception as e:
             self._log(f"클릭 중 오류: {e}")
             return

@@ -17,8 +17,13 @@ import time
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
 # ─────────────────────────── 설정값 ───────────────────────────
-# 카메라 버튼: 하단 RTC 컨트롤 바의 2번째 MediaDeviceButton (1번째=마이크)
-CAMERA_SEL = '[data-sentry-element="MediaDeviceButton"]'  # 아래에서 .nth(1) 사용
+# 카메라 버튼 셀렉터 (앞에서부터 순서대로 시도)
+#  1) aria-label="카메라"  — 현재 ZEP 방식
+#  2) MediaDeviceButton 의 2번째 — 예전 방식 폴백(1번=마이크)
+CAMERA_SELECTORS = [
+    '[aria-label="카메라"]',
+    '[data-sentry-element="MediaDeviceButton"] >> nth=1',
+]
 CLICK_MINUTES = [0, 50]  # 매시 정각·50분
 END_HOUR = 19  # 오후 7시(19:00)까지만 클릭
 PROFILE_DIR = "browser_profile"  # 로그인 세션이 저장되는 폴더 (자동 생성)
@@ -47,13 +52,19 @@ def sleep_until(target: datetime):
 
 def click_camera(page) -> bool:
     """카메라 버튼을 클릭. 성공하면 True, 버튼을 못 찾으면 False."""
-    try:
-        camera = page.locator(CAMERA_SEL).nth(1)
-        camera.wait_for(state="visible", timeout=15000)
-        camera.click()
-        return True
-    except PWTimeoutError:
-        return False
+    deadline = time.time() + 15
+    while True:
+        for sel in CAMERA_SELECTORS:
+            try:
+                camera = page.locator(sel).first
+                if camera.count() > 0 and camera.is_visible():
+                    camera.click()
+                    return True
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.3)
 
 
 def main():
