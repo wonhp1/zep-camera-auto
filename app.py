@@ -41,7 +41,10 @@ CAMERA_SELECTORS = [
 
 # ── 스케줄 규칙 (필요하면 여기 숫자만 바꾸세요) ──
 CLICK_MINUTES = [0, 50]  # 동작 시각: 매시 정각(:00)과 50분(:50)
-END_TIME = (18, 50)  # 마지막 동작 시각 = 18:50 (이후 종료)
+END_TIME = (18, 50)  # 마지막 동작 시각 = 18:50 (카메라 끄기)
+QUIT_TIME = (19, 0)  # 프로그램 완전 종료 시각 = 19:00
+#   ↑ 종료 감시는 마지막 동작(18:50)을 마친 뒤에야 시작한다.
+#     그 전까지는 19:00을 신경 쓰지 않고, 이후 19:00까지 한 번만 대기한다.
 LUNCH_START = (11, 50)  # 점심 시작 — 이때부터 카메라 꺼둠
 LUNCH_END = (13, 0)  # 점심 끝 — 이때 다시 켬 (구간 [11:50, 13:00) 동안 OFF)
 # 카메라 꺼짐(OFF) 판별 신호: 실측 확인됨
@@ -274,7 +277,12 @@ class Worker:
                     self._log("스케줄을 시작합니다.")
                     self._status("스케줄 동작 중")
                     self._state("running")
-                    self._loop(page)
+                    result = self._loop(page)
+                    if result == "quit":
+                        self._log("프로그램을 종료합니다.")
+                        self.shutdown_event.set()
+                        self.q.put(("quit", None))  # GUI에 종료 요청
+                        break
                     self._log("스케줄을 멈췄습니다.")
         except Exception as e:
             self._log(f"오류로 종료되었습니다: {e}")
@@ -284,10 +292,21 @@ class Worker:
             self._state("stopped")
 
     def _loop(self, page):
+        """스케줄 루프. 종료 시각 도달로 끝나면 "quit", 그 외(중지 등)는 None 반환."""
         now = datetime.now()
         end_time = now.replace(
             hour=END_TIME[0], minute=END_TIME[1], second=0, microsecond=0
         )
+        quit_time = now.replace(
+            hour=QUIT_TIME[0], minute=QUIT_TIME[1], second=0, microsecond=0
+        )
+
+        # 이미 종료 시각(19:00)이 지난 뒤 시작한 경우 → 아무 동작 없이 대기 상태로
+        if now >= quit_time:
+            self._log(
+                f"이미 종료 시각({quit_time:%H:%M})이 지났습니다 — 아무 동작도 하지 않습니다."
+            )
+            return None
 
         # 초기 동기화: 시작 시각이 종료 전이면 현재 시간대에 맞는 상태로 즉시 맞춤
         if now <= end_time:
@@ -300,7 +319,7 @@ class Worker:
         while not self.stop_event.is_set():
             target = next_target(datetime.now(), CLICK_MINUTES)
             if target is None or target > end_time:
-                self._log(f"종료 시각({end_time:%H:%M}) 이후입니다. 자동 종료합니다.")
+                self._log(f"마지막 동작({end_time:%H:%M})을 마쳤습니다.")
                 break
 
             want = desired_camera_on(target)
@@ -322,6 +341,30 @@ class Worker:
 
             # 같은 분 중복 동작 방지: 다음 분으로 넘어갈 때까지 대기
             self.stop_event.wait(max(0, 60 - datetime.now().second) + 1)
+
+        if self.stop_event.is_set():
+            return None  # 사용자가 중지 → 대기 상태로
+
+        # ── 여기부터 종료 감시 (마지막 동작을 마친 뒤에만 도달) ──
+        return self._wait_until_quit(quit_time)
+
+    def _wait_until_quit(self, quit_time):
+        """종료 시각까지 대기. 도달하면 "quit", 중지되면 None.
+
+        반복 확인(폴링) 없이 남은 시간만큼 한 번에 대기한다.
+        중지/종료 시 stop_event가 즉시 깨우고, 절전 등으로 일찍 깨면 남은 만큼 다시 대기한다.
+        """
+        self._log(f"{quit_time:%H:%M}에 프로그램을 종료합니다. (대기 중...)")
+        self._status(f"{quit_time:%H:%M} 종료 대기 중")
+        while not self.stop_event.is_set():
+            remaining = (quit_time - datetime.now()).total_seconds()
+            if remaining <= 0:
+                break
+            self.stop_event.wait(remaining)  # 단일 대기 — 도달 시각에 깨어남
+        if self.stop_event.is_set():
+            self._log("종료 대기를 취소했습니다.")
+            return None
+        return "quit"
 
     def _set_camera(self, page, desired):
         """카메라를 desired(True=켜짐) 상태로 만든다. 이미 맞으면 클릭하지 않음."""
@@ -394,7 +437,8 @@ class App:
             f"규칙: 매시 :{CLICK_MINUTES[0]:02d} 켜기 / :{CLICK_MINUTES[-1]:02d} 끄기"
             f"   ·   점심 {LUNCH_START[0]:02d}:{LUNCH_START[1]:02d}~"
             f"{LUNCH_END[0]:02d}:{LUNCH_END[1]:02d} 꺼둠"
-            f"   ·   {END_TIME[0]:02d}:{END_TIME[1]:02d} 종료"
+            f"   ·   {END_TIME[0]:02d}:{END_TIME[1]:02d} 마지막 동작"
+            f"   ·   {QUIT_TIME[0]:02d}:{QUIT_TIME[1]:02d} 프로그램 종료"
         )
         ttk.Label(frm, text=rule_text, foreground="#555").grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(0, 8)
@@ -552,6 +596,9 @@ class App:
                     self.status_var.set(payload)
                 elif kind == "state":
                     self._apply_state(payload)
+                elif kind == "quit":  # 종료 시각 도달 → 앱 완전 종료
+                    self.on_close()
+                    return
         except queue.Empty:
             pass
         self.root.after(100, self.poll_queue)
