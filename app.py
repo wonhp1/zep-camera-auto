@@ -21,6 +21,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -55,21 +56,78 @@ OFF_ICON_PREFIX = "M2.707 2.293"
 DEBUG_PORT = 9222  # Chrome 원격 디버깅 포트
 # 이 앱 전용 Chrome 프로필 폴더 (자동 생성). 평소 쓰는 Chrome과 충돌하지 않도록 분리.
 # 여기서 한 번 Google 로그인하면 이 폴더에 세션이 남아 다음 실행 때 유지됨.
-CHROME_PROFILE_DIR = os.path.abspath("chrome_profile")
+# 실행 위치(cwd)가 아니라 이 스크립트가 있는 폴더 기준 — 더블클릭/런처 실행에도 안전
+CHROME_PROFILE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "chrome_profile"
+)
 
-# macOS Google Chrome 실행 파일 후보 (설치 위치)
-_CHROME_CANDIDATES = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-]
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform.startswith("win")
+
+
+def _chrome_candidates():
+    """OS별 Google Chrome 실행 파일 후보 경로 목록."""
+    if IS_MAC:
+        return [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            os.path.expanduser(
+                "~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            ),
+        ]
+    if IS_WINDOWS:
+        # 환경변수는 시스템 언어/드라이브 구성에 따라 달라지므로 그대로 조합해 쓴다
+        bases = [
+            os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+            os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ]
+        return [
+            os.path.join(b, "Google", "Chrome", "Application", "chrome.exe")
+            for b in bases
+            if b
+        ]
+    # Linux 등
+    return [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/opt/google/chrome/chrome",
+    ]
+
+
+def _chrome_from_registry():
+    """Windows 레지스트리에서 Chrome 설치 경로를 조회 (실패하면 None)."""
+    if not IS_WINDOWS:
+        return None
+    try:
+        import winreg  # Windows 전용 표준 모듈
+    except ImportError:
+        return None
+    key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(root, key_path) as k:
+                path = winreg.QueryValue(k, None)
+                if path and os.path.exists(path):
+                    return path
+        except OSError:
+            continue
+    return None
 
 
 def find_chrome():
-    """설치된 Google Chrome 실행 파일 경로를 반환 (없으면 None)."""
-    for path in _CHROME_CANDIDATES:
+    """설치된 Google Chrome 실행 파일 경로를 반환 (없으면 None). macOS/Windows/Linux 지원."""
+    for path in _chrome_candidates():
         if os.path.exists(path):
             return path
-    return shutil.which("google-chrome") or shutil.which("chrome")
+    from_reg = _chrome_from_registry()  # Windows: 비표준 위치 설치 대응
+    if from_reg:
+        return from_reg
+    # 마지막 폴백: PATH에서 탐색
+    for name in ("google-chrome", "google-chrome-stable", "chrome", "chrome.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 # ──────────────────────────────────────────────────────────────
@@ -166,12 +224,27 @@ class Worker:
         self._kill_chrome()
 
     def _kill_chrome(self):
-        if self.chrome_proc is not None:
+        """띄운 Chrome을 정리한다.
+
+        먼저 정상 종료(terminate)를 시도하고 잠시 기다린다. Windows에서 곧바로
+        강제 종료하면 다음 실행 때 "Chrome이 올바르게 종료되지 않았습니다"
+        복원 프롬프트가 떠서 탭이 중복될 수 있기 때문이다.
+        """
+        if self.chrome_proc is None:
+            return
+        proc = self.chrome_proc
+        self.chrome_proc = None
+        try:
+            proc.terminate()
+        except Exception:
+            return
+        try:
+            proc.wait(timeout=5)  # 정상 종료 대기
+        except Exception:
             try:
-                self.chrome_proc.terminate()
+                proc.kill()  # 그래도 안 죽으면 강제 종료
             except Exception:
                 pass
-            self.chrome_proc = None
 
     def is_alive(self):
         return self.thread is not None and self.thread.is_alive()
@@ -484,34 +557,32 @@ class App:
 
     # ── 클립보드(복사/붙여넣기) ──
     def _enable_clipboard(self):
-        """macOS에서 ttk.Entry가 Cmd+V를 인식하도록 단축키 + 우클릭 메뉴 추가."""
-        # 입력 위젯 클래스 전체에 Cmd/Ctrl 단축키 바인딩
+        """입력 위젯에 복사/붙여넣기 단축키 + 우클릭 메뉴 추가.
+
+        macOS는 ttk.Entry가 Cmd+V를 기본 인식하지 않아 직접 바인딩이 필요하고,
+        Windows/Linux는 Ctrl 조합을 쓰므로 OS에 맞는 수식키를 사용한다.
+        """
+        # macOS는 Command, 그 외는 Control (양쪽 다 걸어도 무해하므로 함께 바인딩)
+        modifiers = ("Command", "Control") if IS_MAC else ("Control",)
+        actions = {
+            "v": "<<Paste>>",
+            "c": "<<Copy>>",
+            "x": "<<Cut>>",
+        }
         for cls in ("TEntry", "Entry", "TSpinbox", "Spinbox", "Text"):
-            for key in ("v", "V"):
-                self.root.bind_class(
-                    cls,
-                    f"<Command-{key}>",
-                    lambda e: (e.widget.event_generate("<<Paste>>"), "break")[1],
-                )
-                self.root.bind_class(
-                    cls,
-                    f"<Control-{key}>",
-                    lambda e: (e.widget.event_generate("<<Paste>>"), "break")[1],
-                )
-            for key in ("c", "C"):
-                self.root.bind_class(
-                    cls,
-                    f"<Command-{key}>",
-                    lambda e: (e.widget.event_generate("<<Copy>>"), "break")[1],
-                )
-            for key in ("x", "X"):
-                self.root.bind_class(
-                    cls,
-                    f"<Command-{key}>",
-                    lambda e: (e.widget.event_generate("<<Cut>>"), "break")[1],
-                )
-            for key in ("a", "A"):
-                self.root.bind_class(cls, f"<Command-{key}>", self._select_all)
+            for mod in modifiers:
+                for key, event in actions.items():
+                    for k in (key, key.upper()):
+                        self.root.bind_class(
+                            cls,
+                            f"<{mod}-{k}>",
+                            lambda e, ev=event: (
+                                e.widget.event_generate(ev),
+                                "break",
+                            )[1],
+                        )
+                for k in ("a", "A"):  # 전체 선택
+                    self.root.bind_class(cls, f"<{mod}-{k}>", self._select_all)
 
         # 우클릭(또는 Ctrl-클릭) 붙여넣기 메뉴 — URL 입력란
         menu = tk.Menu(self.root, tearoff=0)
