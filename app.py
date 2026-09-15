@@ -505,6 +505,8 @@ class Worker:
             self._log("카메라 장치 선택 버튼을 찾지 못해 장치 확인을 건너뜁니다.")
             return
 
+        # 카메라를 켠 직후엔 ZEP이 장치 목록을 아직 채우지 않았을 수 있어 잠시 대기
+        page.wait_for_timeout(1500)
         item = self._open_device_item(page, trigger)
         if item is None:
             return
@@ -532,27 +534,41 @@ class Worker:
         else:
             self._log(f"⚠ '{PREFERRED_CAMERA}' 선택이 확인되지 않았습니다. 직접 확인해 주세요.")
 
-    def _open_device_item(self, page, trigger):
-        """드롭다운을 열고 선호 장치 메뉴 항목 locator 반환. 없으면 메뉴를 닫고 None."""
-        try:
-            trigger.click()
-            menu = page.locator('[role="menu"]').first
-            menu.wait_for(state="visible", timeout=3000)
-            radios = menu.locator('[role="menuitemradio"]')
-            item = radios.filter(has_text=PREFERRED_CAMERA).first
-            if item.count() == 0:
+    def _open_device_item(self, page, trigger, attempts=3):
+        """드롭다운을 열고 선호 장치 메뉴 항목 locator 반환. 끝내 없으면 메뉴를 닫고 None.
+
+        - 트리거는 누를 때마다 열림/닫힘이 토글되므로, 이미 열려 있으면 다시 누르지 않는다.
+        - 장치 목록은 비동기로 채워지므로 항목이 나타날 때까지 기다리고,
+          그래도 없으면 메뉴를 닫았다가 잠시 후 다시 연다(최대 attempts회).
+        """
+        names = []
+        for attempt in range(1, attempts + 1):
+            try:
+                if trigger.get_attribute("aria-expanded") != "true":
+                    trigger.click()
+                menu = page.locator('[role="menu"]').first
+                menu.wait_for(state="visible", timeout=3000)
+                radios = menu.locator('[role="menuitemradio"]')
+                try:
+                    radios.first.wait_for(state="visible", timeout=3000)
+                except Exception:
+                    pass  # 목록이 비어 있음 → 아래에서 재시도
+                item = radios.filter(has_text=PREFERRED_CAMERA).first
+                if item.count() > 0:
+                    return item
                 names = [t.strip() for t in radios.all_inner_texts()]
-                self._close_menu(page)
-                self._log(
-                    f"⚠ 카메라 장치 목록에 '{PREFERRED_CAMERA}'가 없습니다 "
-                    f"(현재 목록: {', '.join(names) or '없음'}). OBS 가상 카메라가 시작돼 있는지 확인하세요."
-                )
-                return None
-            return item
-        except Exception as e:
+            except Exception as e:
+                names = [f"오류: {e}"]
             self._close_menu(page)
-            self._log(f"카메라 장치 메뉴를 여는 중 오류: {e}")
-            return None
+            if attempt < attempts:
+                page.wait_for_timeout(1500)  # 목록이 채워질 시간을 주고 다시 연다
+
+        self._log(
+            f"⚠ 카메라 장치 목록에서 '{PREFERRED_CAMERA}'를 찾지 못했습니다 "
+            f"({attempts}회 시도, 마지막 목록: {', '.join(names) or '없음'}). "
+            "OBS 가상 카메라가 시작돼 있는지 확인하세요."
+        )
+        return None
 
     def _close_menu(self, page):
         """열려 있는 드롭다운 메뉴가 있을 때만 Escape로 닫는다."""
