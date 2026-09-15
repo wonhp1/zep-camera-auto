@@ -53,6 +53,17 @@ LUNCH_END = (13, 0)  # 점심 끝 — 이때 다시 켬 (구간 [11:50, 13:00) �
 #   ON  = 'text-red' 없음 (초록 text-[#61986A]) + 일반 카메라 아이콘
 OFF_ICON_PREFIX = "M2.707 2.293"
 
+# ── 카메라 장치 자동 선택 ──
+# ZEP은 카메라를 다시 켤 때 기본 카메라(MacBook 카메라)로 돌아가는 경우가 있다.
+# 카메라를 켠 직후 장치 선택 드롭다운에서 아래 이름이 들어간 장치를 자동 선택한다.
+# (부분 일치, 빈 문자열 "" 로 두면 이 기능을 끔)
+PREFERRED_CAMERA = "OBS Virtual Camera"
+# 카메라 버튼 오른쪽의 장치 선택 드롭다운 버튼 (카메라 버튼과 같은 MediaDeviceControl 그룹 안)
+CAMERA_DROPDOWN_SEL = (
+    'div[data-sentry-component="MediaDeviceControl"]:has([aria-label="카메라"]) '
+    '[aria-haspopup="menu"]'
+)
+
 DEBUG_PORT = 9222  # Chrome 원격 디버깅 포트
 # 이 앱 전용 Chrome 프로필 폴더 (자동 생성). 평소 쓰는 Chrome과 충돌하지 않도록 분리.
 # 여기서 한 번 Google 로그인하면 이 폴더에 세션이 남아 다음 실행 때 유지됨.
@@ -178,6 +189,10 @@ def read_camera_state(page):
         btn = camera_button(page)
         if btn is None:
             return None
+        pressed = btn.get_attribute("aria-pressed")
+        if pressed in ("true", "false"):  # 신호 0: aria-pressed (가장 정확)
+            return pressed == "true"
+        # aria-pressed가 없으면 예전 신호로 폴백
         tokens = (btn.get_attribute("class") or "").split()
         has_red = "text-red" in tokens  # 신호 1: 빨강 토큰 = 꺼짐
         d = btn.locator("path").first.get_attribute("d") or ""
@@ -467,12 +482,86 @@ class Worker:
             self._log(
                 f"[{datetime.now():%H:%M:%S}] 카메라를 {label}(으)로 변경했습니다."
             )
+            if desired:  # 켰을 때만 — ZEP이 기본 카메라로 되돌리는 문제 보정
+                self._ensure_preferred_camera(page)
         else:
             now_txt = "ON" if after else "OFF" if after is not None else "불명"
             self._log(
                 f"⚠ 카메라를 {label}(으)로 바꿨지만 약 6초 안에 확인되지 않았습니다 "
                 f"(현재={now_txt}). 실제로는 바뀌었을 수 있으니 다음 동작에서 보정됩니다."
             )
+
+    def _ensure_preferred_camera(self, page):
+        """카메라가 켜진 뒤, 장치 선택 드롭다운에서 PREFERRED_CAMERA를 선택한다.
+
+        이미 선택돼 있으면 메뉴만 열었다 닫고, 다르면 클릭한 뒤 다시 열어 체크 상태로 검증한다.
+        """
+        if not PREFERRED_CAMERA:
+            return
+        try:
+            trigger = page.locator(CAMERA_DROPDOWN_SEL).first
+            trigger.wait_for(state="visible", timeout=10000)
+        except Exception:
+            self._log("카메라 장치 선택 버튼을 찾지 못해 장치 확인을 건너뜁니다.")
+            return
+
+        item = self._open_device_item(page, trigger)
+        if item is None:
+            return
+        if item.get_attribute("aria-checked") == "true":
+            self._close_menu(page)
+            self._log(f"카메라 장치: 이미 '{PREFERRED_CAMERA}' 선택됨.")
+            return
+
+        try:
+            item.click()  # 선택하면 메뉴는 자동으로 닫힘
+        except Exception as e:
+            self._close_menu(page)
+            self._log(f"카메라 장치 선택 중 오류: {e}")
+            return
+        page.wait_for_timeout(1000)  # 장치 전환 반영 대기
+
+        # 검증: 다시 열어 체크 상태 확인
+        item = self._open_device_item(page, trigger)
+        if item is None:
+            return
+        ok = item.get_attribute("aria-checked") == "true"
+        self._close_menu(page)
+        if ok:
+            self._log(f"카메라 장치를 '{PREFERRED_CAMERA}'(으)로 전환했습니다.")
+        else:
+            self._log(f"⚠ '{PREFERRED_CAMERA}' 선택이 확인되지 않았습니다. 직접 확인해 주세요.")
+
+    def _open_device_item(self, page, trigger):
+        """드롭다운을 열고 선호 장치 메뉴 항목 locator 반환. 없으면 메뉴를 닫고 None."""
+        try:
+            trigger.click()
+            menu = page.locator('[role="menu"]').first
+            menu.wait_for(state="visible", timeout=3000)
+            radios = menu.locator('[role="menuitemradio"]')
+            item = radios.filter(has_text=PREFERRED_CAMERA).first
+            if item.count() == 0:
+                names = [t.strip() for t in radios.all_inner_texts()]
+                self._close_menu(page)
+                self._log(
+                    f"⚠ 카메라 장치 목록에 '{PREFERRED_CAMERA}'가 없습니다 "
+                    f"(현재 목록: {', '.join(names) or '없음'}). OBS 가상 카메라가 시작돼 있는지 확인하세요."
+                )
+                return None
+            return item
+        except Exception as e:
+            self._close_menu(page)
+            self._log(f"카메라 장치 메뉴를 여는 중 오류: {e}")
+            return None
+
+    def _close_menu(self, page):
+        """열려 있는 드롭다운 메뉴가 있을 때만 Escape로 닫는다."""
+        try:
+            if page.locator('[role="menu"]').count() > 0:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
 
     def _wait_camera_state(self, page, desired, attempts=20, interval=0.3):
         """클릭 후 카메라 상태가 desired로 반영될 때까지 폴링. 마지막으로 읽은 상태 반환."""
